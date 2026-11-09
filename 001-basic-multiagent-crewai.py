@@ -5,11 +5,62 @@ from bs4 import BeautifulSoup
 from crewai import Agent, Task, Crew
 from langchain.tools import tool
 from langchain_openai import ChatOpenAI
+from langchain_core.messages import AIMessageChunk
+from langchain_core.outputs import ChatGenerationChunk
 from langchain_community.tools.tavily_search import TavilySearchResults
+import re
+import tiktoken
 
-load_dotenv()
+load_dotenv()  # the .env file must include OPENAI_API_KEY=... and TAVILY_API_KEY=...
 
-llm = ChatOpenAI(model="gpt-4-turbo-preview")
+# Original version: this example used gpt-4-turbo-preview.
+# OpenAI has since shut that model down. Today we use gpt-6-luna.
+MODEL = "gpt-6-luna"  # small, fast and affordable current OpenAI model
+
+# CrewAI counts the tokens of each request with the tiktoken library.
+# This version of tiktoken does not know gpt-6-luna yet, so it would print
+# a warning ("Could not automatically map gpt-6-luna to a tokeniser") on
+# every call. We tell it to use o200k_base, the encoding of the most recent
+# OpenAI models this version knows. It is only used to estimate tokens.
+tiktoken.model.MODEL_TO_ENCODING[MODEL] = "o200k_base"
+
+
+class CrewChatOpenAI(ChatOpenAI):
+    """ChatOpenAI adapted so this version of CrewAI works with current OpenAI models."""
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        # This version of CrewAI asks the model to stop writing when it reaches
+        # "Observation" (the "stop" parameter), so the agent can run the tool and
+        # write the real observation itself. Recent OpenAI models do not accept
+        # the "stop" parameter, so we do not send it, and we cut the answer at
+        # that same word here instead. The agent sees exactly what it saw before.
+        result = super()._generate(messages, stop=None, run_manager=run_manager, **kwargs)
+        for generation in result.generations:
+            text = generation.message.content
+            if stop:
+                text = re.split("|".join(map(re.escape, stop)), text, maxsplit=1)[0]
+            # Recent OpenAI models mark the sources they use with citation markers,
+            # for example "cite turn6f4581" wrapped in invisible characters.
+            # Each agent passes its work to the rest of the crew, so we remove
+            # the markers here, before any other agent reads them.
+            text = re.sub(r"\ue200cite\ue202.*?\ue201", "", text).strip()
+            generation.message.content = text
+            generation.text = text
+        return result
+
+    def _stream(self, messages, stop=None, run_manager=None, **kwargs):
+        # This version of CrewAI reads the model's answer as a stream. To apply
+        # the two changes above, we get the whole answer with _generate and pass
+        # it on as a single piece.
+        result = self._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+        text = result.generations[0].message.content
+        yield ChatGenerationChunk(message=AIMessageChunk(content=text))
+
+
+# This version of langchain-openai sends temperature=0.7 by default,
+# but recent OpenAI models only accept the default value (1),
+# so we set temperature=1 explicitly.
+llm = CrewChatOpenAI(model=MODEL, temperature=1)
 
 @tool("process_search_tool", return_direct=False)
 def process_search_tool(url: str) -> str:
